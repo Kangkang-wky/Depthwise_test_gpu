@@ -1,4 +1,4 @@
-# Depthwise_test_dcu
+# Depthwise_test_gpu
 Implementation of Optimized Depthwise Convolution Kernels and PyTorch Extensions on Deep Computing Unit
 
 ## Introduction

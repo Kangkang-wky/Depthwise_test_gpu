@@ -10,8 +10,12 @@
 #include <fstream>
 #include <unistd.h>
 
-#include <hip/hip_runtime.h>
-#include <miopen/miopen.h>
+
+#include "cudnn.h"
+#include "device_launch_parameters.h"
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
 
 #include "warmup.h"
 #include "Filter3x3_Input7x7_Stride1.h"
@@ -32,46 +36,78 @@
 using namespace std;
 
 /*
-Hip and MIOpen Error Handling
+CUDA and CUDNN Error Handling
 
-checkHip(err) - to check if an HIP API call returned some error.
-checkKernel() - to check if the kernel invocation is failed.
+CHECK_CUDA(err) - to check if an CUDA API call returned some error.
 */
-#define checkHip(err) __checkHip(err, __FILE__, __LINE__)
-#define checkKernel() __checkKernel(__FILE__, __LINE__)
 
-inline void __checkHip(hipError_t err, const char* file, const int line) {
-	if (hipSuccess != err) {
-		printf("checkHip() failed at %s : %i : %s\n", file, line, hipGetErrorString(err));
-		exit(-1);
-	}
+#define CHECK_CUDA(func)                                                       \
+  {                                                                            \
+    cudaError_t cuda_error = (func);                                           \
+    if (cuda_error != cudaSuccess)                                             \
+      printf("%s %d CUDA: %s\n", __FILE__, __LINE__,                           \
+             cudaGetErrorString(cuda_error));                                  \
+  }
+
+// cudnn runtime error
+#define CHECK_CUDNN(func)                                                      \
+  {                                                                            \
+    cudnnStatus_t cudnn_status = (func);                                       \
+    if (cudnn_status != CUDNN_STATUS_SUCCESS)                                  \
+      printf("%s %d CUDNN: %s\n", __FILE__, __LINE__,                          \
+             cudnnGetErrorString(cudnn_status));                               \
+  }
+
+// cublas runtime error
+#define CHECK_CUBLAS(func)                                                     \
+  {                                                                            \
+    cublasStatus_t cublas_status = (func);                                     \
+    if (cublas_status != CUBLAS_STATUS_SUCCESS)                                \
+      printf("%s %d CUBLAS: %s\n", __FILE__, __LINE__,                         \
+             cublasGetErrorString(cublas_status));                             \
+  }
+
+// check cuda runtime is success error ?  
+inline bool isCudaSuccess(cudaError_t status) {
+  cudaError_t error = status;
+  if (error != cudaSuccess) {
+    std::cerr << "Got bad cuda status: " << cudaGetErrorString(error)
+              << std::endl;
+    return false;
+  }
+  return true;
 }
 
-inline void __checkKernel(const char* file, const int line) {
-	hipError_t err = hipGetLastError();
-	if (hipSuccess != err) {
-		printf("checkKernel() failed at %s : %i : %s\n", file, line, hipGetErrorString(err));
-		exit(-1);
-	}
-}
+
+// benchmark 基准测试部分
+const char *cudnnAlgName[] = {
+    "CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM",
+    "CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM",
+    "CUDNN_CONVOLUTION_FWD_ALGO_GEMM",
+    "CUDNN_CONVOLUTION_FWD_ALGO_DIRECT",
+    "CUDNN_CONVOLUTION_FWD_ALGO_FFT",
+    "CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING",
+    "CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD",
+    "CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED",
+    "CUDNN_CONVOLUTION_FWD_ALGO_COUNT"};
 
 /*
 compareOutput():
-	Compare the result calculated by our kernel and that by the MIOpen library.
-	Use MIOpen library as a reference.
+	Compare the result calculated by our kernel and that by the CUDNN library.
+	Use CUDNN library as a reference.
 Input:
 	n            - batch number
 	c            - channel number
 	h            - height
 	w            - width
 	kernelOutput - output data of our kernel
-	miopenOutput  - output data of the MIOpen
+	cudnnOutput  - output data of the CUDNN
 	delta        - a small value. Allowed numerical differece between each element
 Output:
 	-1           - our kernel is wrong
 	0            - out kernel is correct
 */
-int compareOutput(int n, int c, int h, int w, const float* kernelOutput, const float* miopenOutput, float delta) {
+int compareOutput(int n, int c, int h, int w, const float* kernelOutput, const float* cudnnOutput, float delta) {
 	int i, j, k, l;
 
 	// Loop over each element, and compare the value.
@@ -80,8 +116,8 @@ int compareOutput(int n, int c, int h, int w, const float* kernelOutput, const f
 		for (j = 0; j < c; j++) {
 			for (k = 0; k < h; k++) {
 				for (l = 0; l < w; l++) {
-					if (abs(kernelOutput[i * c * h * w + j * h * w + k * w + l] - miopenOutput[i * c * h * w + j * h * w + k * w + l]) > delta) {
-						printf("%f, %f\n", kernelOutput[i * c * h * w + j * h * w + k * w + l], miopenOutput[i * c * h * w + j * h * w + k * w + l]);
+					if (abs(kernelOutput[i * c * h * w + j * h * w + k * w + l] - cudnnOutput[i * c * h * w + j * h * w + k * w + l]) > delta) {
+						printf("%f, %f\n", kernelOutput[i * c * h * w + j * h * w + k * w + l], cudnnOutput[i * c * h * w + j * h * w + k * w + l]);
 						printf("Wrong! Output Batch Idx: %d, Channel Idx: %d, Row Idx: %d, Col Idx: %d\n", i, j, k, l);
 						return -1;
 					}
@@ -168,8 +204,8 @@ int main(int argc, char* argv[]) {
 		hostInput[i] = (float)(float(rand()) / float((RAND_MAX)) * 5.0);
 	}
 	float* deviceInput;
-	checkHip(hipMalloc((void**)&deviceInput, inputSize * sizeof(float)));
-	checkHip(hipMemcpy(deviceInput, hostInput, inputSize * sizeof(float), hipMemcpyHostToDevice));
+	CHECK_CUDA(cudaMalloc((void**)&deviceInput, inputSize * sizeof(float)));
+	CHECK_CUDA(cudaMemcpy(deviceInput, hostInput, inputSize * sizeof(float), cudaMemcpyHostToDevice));
 
 	// allocate host memory and device memory for filter data, and copy it from host to device.
 	float* hostFilter = (float*)malloc(filterSize * sizeof(float));
@@ -178,26 +214,26 @@ int main(int argc, char* argv[]) {
 		hostFilter[i] = (float)(float(rand()) / float((RAND_MAX)) * 5.0);
 	}
 	float* deviceFilter;
-	checkHip(hipMalloc((void**)&deviceFilter, filterSize * sizeof(float)));
-	checkHip(hipMemcpy(deviceFilter, hostFilter, filterSize * sizeof(float), hipMemcpyHostToDevice));
+	CHECK_CUDA(cudaMalloc((void**)&deviceFilter, filterSize * sizeof(float)));
+	CHECK_CUDA(cudaMemcpy(deviceFilter, hostFilter, filterSize * sizeof(float), cudaMemcpyHostToDevice));
 
 	// allocate host memory and device memory for kernel output data
 	float* hostKernelOutput = (float*)malloc(outputSize * sizeof(float));
 	float* deviceKernelOutput;
-	checkHip(hipMalloc((void**)&deviceKernelOutput, outputSize * sizeof(float)));
+	CHECK_CUDA(cudaMalloc((void**)&deviceKernelOutput, outputSize * sizeof(float)));
 
-	// allocate host memory and device memory for MIOpen output data
-	float* hostMiopenOutput = (float*)malloc(outputSize * sizeof(float));
-	float* deviceMiopenOutput;
-	checkHip(hipMalloc((void**)&deviceMiopenOutput, outputSize * sizeof(float)));
+	// allocate host memory and device memory for Cudnn output data
+	float* hostCudnnOutput = (float*)malloc(outputSize * sizeof(float));
+	float* deviceCudnnOutput;
+	CHECK_CUDA(cudaMalloc((void**)&deviceCudnnOutput, outputSize * sizeof(float)));
 
-	// Use Hip event to measure running time
+	// Use CUDA event to measure running time
 	float elapsedTime = 0.0;
 	float kernelTime = 0.0;
-	float miopenTime = 0.0;
-	hipEvent_t start, stop;
-	hipEventCreate(&start);
-	hipEventCreate(&stop);
+	float cudnnTime = 0.0;
+	cudaEvent_t start, stop;
+	CHECK_CUDA(cudaEventCreate(&start));
+	CHECK_CUDA(cudaEventCreate(&stop));
 
 	// GPU warm up for benchmarking
 	warmup<<<1024, 128>>>();
@@ -208,7 +244,7 @@ int main(int argc, char* argv[]) {
 			if (inputHeight == 7) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 32);
 				dim3 blockSize(7 * 32, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input7x7_Stride1<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -216,15 +252,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 14) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 16);
 				dim3 blockSize(14 * 16, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input14x14_Stride1<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -232,15 +268,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 28) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 8);
 				dim3 blockSize(28 * 8, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input28x28_Stride1<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -248,15 +284,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 56) {
 				dim3 gridSize(outputBatchNumber, outputChannel);
 				dim3 blockSize(4 * 56, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input56x56_Stride1<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -264,15 +300,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 112) {
 				dim3 gridSize(outputBatchNumber, outputChannel * 4);
 				dim3 blockSize(2 * 112, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input112x112_Stride1<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -280,9 +316,9 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 		}
@@ -290,7 +326,7 @@ int main(int argc, char* argv[]) {
 			if (inputHeight == 7) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 32);
 				dim3 blockSize(7 * 32, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter5x5_Input7x7_Stride1<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -298,15 +334,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 14) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 16);
 				dim3 blockSize(14 * 16, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter5x5_Input14x14_Stride1<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -314,15 +350,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 28) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 8);
 				dim3 blockSize(28 * 8, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter5x5_Input28x28_Stride1<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -330,9 +366,9 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 		}
@@ -342,7 +378,7 @@ int main(int argc, char* argv[]) {
 			if (inputHeight == 14) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 32);
 				dim3 blockSize(7 * 32, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input14x14_Stride2<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -350,15 +386,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 28) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 8);
 				dim3 blockSize(14 * 8, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input28x28_Stride2<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -366,15 +402,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 56) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 2);
 				dim3 blockSize(28 * 2, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input56x56_Stride2<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -382,15 +418,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 112) {
 				dim3 gridSize(outputBatchNumber, outputChannel * 2);
 				dim3 blockSize(56 * 4, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter3x3_Input112x112_Stride2<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -398,9 +434,9 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 		}
@@ -408,7 +444,7 @@ int main(int argc, char* argv[]) {
 			if (inputHeight == 14) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 32);
 				dim3 blockSize(7 * 32, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter5x5_Input14x14_Stride2<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -416,15 +452,15 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 			else if (inputHeight == 56) {
 				dim3 gridSize(outputBatchNumber, outputChannel / 2);
 				dim3 blockSize(28 * 2, 1);
-				hipEventRecord(start);
+				cudaEventRecord(start);
 				Filter5x5_Input56x56_Stride2<<<gridSize, blockSize>>> (
 					deviceInput, deviceFilter, deviceKernelOutput,
 					inputBatchNumber, inputChannel, inputHeight, inputWidth,
@@ -432,101 +468,125 @@ int main(int argc, char* argv[]) {
 					outputBatchNumber, outputChannel, outputHeight, outputWidth,
 					paddingWidth, stride,
 					alpha, beta);
-				hipEventRecord(stop);
-				hipEventSynchronize(stop);
-				hipEventElapsedTime(&elapsedTime, start, stop);
+				cudaEventRecord(stop);
+				cudaEventSynchronize(stop);
+				cudaEventElapsedTime(&elapsedTime, start, stop);
 				kernelTime = elapsedTime;
 			}
 		}
 	}
 	
 	// Copy kernel output from device to host
-	checkHip(hipMemcpy(hostKernelOutput, deviceKernelOutput, outputSize * sizeof(float), hipMemcpyDeviceToHost));
+	CHECK_CUDA(cudaMemcpy(hostKernelOutput, deviceKernelOutput, outputSize * sizeof(float), cudaMemcpyDeviceToHost));
 	
-    // Create miopen
-    miopenHandle_t miopen;
-    miopenCreate(&miopen);
+    // Create cudnn
+    cudnnHandle_t convCudnn;
+    CHECK_CUDNN(cudnnCreate(&convCudnn));
     
     // input descriptor
-    miopenTensorDescriptor_t inputDesc;
-    miopenCreateTensorDescriptor(&inputDesc);
-    miopenSet4dTensorDescriptor(inputDesc, miopenFloat, inputBatchNumber, inputChannel, inputHeight, inputWidth);
-    
+    cudnnTensorDescriptor_t convInputDescriptor;
+	CHECK_CUDNN(cudnnCreateTensorDescriptor(&convInputDescriptor));
+	CHECK_CUDNN(cudnnSetTensor4dDescriptor(convInputDescriptor,
+											/*format=*/CUDNN_TENSOR_NHWC,
+											/*dataType=*/CUDNN_DATA_FLOAT,
+											/*batch_size=*/inputBatchNumber,
+											/*in_channels=*/inputChannel,
+											/*image_height=*/inputHeight,
+											/*image_width=*/inputWidth));
+
     // filter descriptor
-    miopenTensorDescriptor_t filterDesc;
-    miopenCreateTensorDescriptor(&filterDesc);
-    miopenSet4dTensorDescriptor(filterDesc, miopenFloat, filterLayerNumber, filterChannel, filterHeight, filterWidth);
+    cudnnFilterDescriptor_t convKernelDescriptor;
+	CHECK_CUDNN(cudnnCreateFilterDescriptor(&convKernelDescriptor));
+	CHECK_CUDNN(cudnnSetFilter4dDescriptor(convKernelDescriptor,
+											/*dataType=*/CUDNN_DATA_FLOAT,
+											/*format=*/CUDNN_TENSOR_NHWC,
+											/*out_channels=*/filterLayerNumber,
+											/*in_channels=*/filterChannel,
+											/*kernel_height=*/filterHeight,
+											/*kernel_width=*/filterWidth));
 
     // output descriptor
-    miopenTensorDescriptor_t outputDesc;
-    miopenCreateTensorDescriptor(&outputDesc);
-    miopenSet4dTensorDescriptor(outputDesc, miopenFloat, outputBatchNumber, outputChannel, outputHeight, outputWidth);
-    
+    cudnnTensorDescriptor_t convOutputDescriptor;
+	CHECK_CUDNN(cudnnCreateTensorDescriptor(&convOutputDescriptor));
+	CHECK_CUDNN(cudnnSetTensor4dDescriptor(convOutputDescriptor,
+											/*format=*/CUDNN_TENSOR_NHWC,
+											/*dataType=*/CUDNN_DATA_FLOAT,
+											/*batch_size=*/outputBatchNumber,
+											/*out_channels=*/outputChannel,
+											/*image_height=*/outputHeight,
+											/*image_width=*/outputWidth));
+
     // convolution descriptor
-    miopenConvolutionDescriptor_t convDesc;
-    miopenCreateConvolutionDescriptor(&convDesc);
-    
-    miopenInitConvolutionDescriptor(convDesc,miopenConvolution, paddingHeight, paddingWidth, stride, stride, 1, 1);
-    miopenSetConvolutionGroupCount(convDesc, inputChannel);
+    cudnnConvolutionDescriptor_t convDesc;
+	// 初始化 conv 描述符
+	CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&convDesc));
+	CHECK_CUDNN(cudnnSetConvolution2dDescriptor(convDesc,
+												/*pad_height=*/pad,
+												/*pad_width=*/pad,
+												/*vertical_stride=*/stride,
+												/*horizontal_stride=*/stride,
+												/*dilation_height=*/1,
+												/*dilation_width=*/1,
+												/*mode=*/CUDNN_CROSS_CORRELATION,
+												/*dataType=*/CUDNN_DATA_FLOAT));
+
+	// 分组卷积设置, 分组卷积为 inputChannel
+	CHECK_CUDNN(cudnnSetConvolutionGroupCount(convDesc, inputChannel));
+
+
+	// set algorithm
+	int algo_type = 1;
+	cudnnConvolutionFwdAlgo_t algo = cudnnConvolutionFwdAlgo_t(algo_type);
 
  	// create workspace
     size_t workspaceSize = 0;
     void* workspaceData = nullptr;
-    miopenConvolutionForwardGetWorkSpaceSize(miopen, inputDesc, filterDesc, convDesc, outputDesc, &workspaceSize);
-    checkHip(hipMalloc(&workspaceData, workspaceSize));
+	// 为 conv 申请空间大小
+	CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(
+		convCudnn, convInputDescriptor, convKernelDescriptor, convDesc,
+		convOutputDescriptor, algo, &workspaceSize));
+	// 为 conv 实际分配空间
+	CHECK_CUDA(cudaMalloc(&workspaceData, workspaceSize));
 
-    // set algorithm
-    int returnedAlgoCount = 0;
-    miopenConvAlgoPerf_t *miopenPerfResults = new miopenConvAlgoPerf_t[1];
 
-    miopenFindConvolutionForwardAlgorithm(
-        miopen, inputDesc, deviceInput,
-        filterDesc, deviceFilter,
-        convDesc,
-        outputDesc, deviceMiopenOutput, 1,
-        &returnedAlgoCount, miopenPerfResults, workspaceData,
-        workspaceSize, false);
+    // Use Cudnn to check kernel result and measure running time
+    cudaEventRecord(start);
+	CHECK_CUDNN(cudnnConvolutionForward(
+		convCudnn, &alpha, convInputDescriptor, deviceInput, convKernelDescriptor,
+		deviceFilter, convDesc, algo, workspaceData, workspaceSize, &beta,
+		convOutputDescriptor, output))
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsedTime, start, stop);
+    cudnnTime = elapsedTime;
 
-    // Use MIOpen to check kernel result and measure running time
-    hipEventRecord(start);
-    miopenConvolutionForward(
-	    miopen, &alpha, inputDesc, deviceInput,
-        filterDesc, deviceFilter,
-        convDesc, miopenPerfResults->fwd_algo, &beta,
-        outputDesc, deviceMiopenOutput, workspaceData,
-        workspaceSize);
-    hipEventRecord(stop);
-    hipEventSynchronize(stop);
-    hipEventElapsedTime(&elapsedTime, start, stop);\
-    miopenTime = elapsedTime;
+    // Copy CUDNN result from device to host
+    CHECK_CUDA(cudaMemcpy(hostCudnnOutput, deviceCudnnOutput, outputSize * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // Copy MIOpen result from device to host
-    checkHip(hipMemcpy(hostMiopenOutput, deviceMiopenOutput, outputSize * sizeof(float), hipMemcpyDeviceToHost));
-
-    // Compare Kernel result and MIOpen result
-    if (compareOutput(outputBatchNumber, outputChannel, outputHeight, outputWidth, hostKernelOutput, hostMiopenOutput, 1) == 0) {
+    // Compare Kernel result and Cudnn result
+    if (compareOutput(outputBatchNumber, outputChannel, outputHeight, outputWidth, hostKernelOutput, hostCudnnOutput, 1) == 0) {
 		printf("Kernel Calculation Correct.\n");
-		printf("MIOpen time : %f ms.\n", miopenTime);
+		printf("Cudnn time : %f ms.\n", cudnnTime);
 		printf("Kernel time : %f ms.\n", kernelTime);
     }
 
 	free(hostInput);
 	free(hostFilter);
 	free(hostKernelOutput);
-	free(hostMiopenOutput);
+	free(hostCudnnOutput);
 
-	hipFree(deviceInput);
-	hipFree(deviceFilter);
-	hipFree(deviceKernelOutput);
-	hipFree(deviceMiopenOutput);
+	cudaFree(deviceInput);
+	cudaFree(deviceFilter);
+	cudaFree(deviceKernelOutput);
+	cudaFree(deviceCudnnOutput);
 
-	miopenDestroy(miopen);
-    miopenDestroyTensorDescriptor(inputDesc);
-    miopenDestroyTensorDescriptor(outputDesc);
-    miopenDestroyConvolutionDescriptor(convDesc);
-    miopenDestroyTensorDescriptor(filterDesc);
-    hipFree(workspaceData);
+	CHECK_CUDA(cudnnDestroy(convCudnn));
+    CHECK_CUDA(cudnnDestroyTensorDescriptor(convInputDescriptor));
+    CHECK_CUDA(cudnnDestroyTensorDescriptor(convOutputDescriptor));
+    CHECK_CUDA(cudnnDestroyConvolutionDescriptor(convDesc));
+    CHECK_CUDA(cudnnDestroyFilterDescriptor(convKernelDescriptor));
+    CHECK_CUDA(cudaFree(workspaceData));
 
-	checkHip(hipDeviceReset());
+	CHECK_CUDA(cudaDeviceReset());
 	return 0;
 }
